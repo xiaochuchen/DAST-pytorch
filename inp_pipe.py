@@ -92,7 +92,7 @@ def procExample(orig: str, styref: str, score: int, vocab: Vocabulary,
     go = vocab.word2id(GO)
     eos = vocab.word2id(EOS)
 
-    label = torch.tensor(1 if score > 0 else 0, dtype=torch.long, device=device)
+    label = torch.tensor(1 if score > 0 else 0, dtype=torch.float, device=device)
     ids = [vocab.word2id(w) for w in orig.split()[:mlen - 1]]
 
     enc = np.ones(mlen - 1, dtype=np.int)*pad
@@ -110,7 +110,7 @@ def procExample(orig: str, styref: str, score: int, vocab: Vocabulary,
     encLen = torch.tensor(len(ids), dtype=torch.long, device=device)
     decLen = torch.tensor(len(ids) + 1, dtype=torch.long, device=device)
 
-    tgtDomT = torch.tensor(tgtDom, dtype=torch.long, device=device)
+    tgtDomT = torch.tensor(tgtDom, dtype=torch.float, device=device)
     return Example(encT, encLen, decT, decLen, tarT, label, tgtDomT, orig, styref)
 
 
@@ -194,5 +194,5 @@ def getOnlineDataLoader(path, mode, vocab, bz, mlen, device=None):
         ])
 
     bds = BinaryDataset(examples, isOnline=True)
-    bdl = DataLoader(bds, batch_size=bz, shuffle=True)
+    bdl = DataLoader(bds, batch_size=bz)
     return bdl

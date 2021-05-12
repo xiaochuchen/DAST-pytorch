@@ -31,12 +31,17 @@ class DASTTrainer(object):
         self.batchnum = max(len(srcLoader), len(tgtLoader))
         self.checkpoint = 1 * self.batchnum
         self.cutAcc = 0.90
-        self.optimAE = torch.optim.Adam(list(model.gen.parameters()), lr=lr)
-        self.optimDisc = torch.optim.Adam(list(model.discTgt.parameters()) +
-                                    list(model.discSrc.parameters()), lr=lr)
-        self.optimTot = torch.optim.Adam(list(model.parameters()), lr=lr)
+        self.optimAE = torch.optim.AdamW(list(model.gen.parameters()), lr=lr,
+                                        betas=(0.5, 0.999))
+        self.optimDisc = torch.optim.AdamW(list(model.discTgt.parameters()) +
+                                    list(model.discSrc.parameters()), lr=lr,
+                                        betas=(0.5, 0.999))
+        self.optimTot = torch.optim.AdamW(list(model.parameters()), lr=lr,
+                                         betas=(0.5, 0.999))
         self.writer = SummaryWriter(str(logdir))
         self.smoothie = SmoothingFunction().method4
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimAE, step_size=2, gamma=0.5, verbose=True)
 
     def train(self, ep_init, gstep):
         bestbleu = 0.0
@@ -45,7 +50,7 @@ class DASTTrainer(object):
             for src, tgt in cyclingZip(self.srcLoader, self.tgtLoader, self.batchnum):
                 self.model.train()
                 aeLoss, discLoss, genLoss = self._trainPrepStep(src, tgt) \
-                    if ep <= self.prepEpoch else self._trainStyleStep(src, tgt)
+                    if ep < self.prepEpoch else self._trainStyleStep(src, tgt)
 
                 # print out
                 pbar.update(1)
@@ -63,31 +68,35 @@ class DASTTrainer(object):
                 outSample = self.outpath / f"ol_results_{ep}_{gstep}.txt"
                 outModel = self.outpath / f"iytransmod_{ep}_{gstep}.pt"
                 if gstep % self.checkpoint == 0:
-                    bleuRef, bleuOri, tranAcc, domAcc, *_ = \
+                    bleuRef, bleuOri, tranAcc, domAcc, _, recBleu = \
                         self.evaluate(self.valLoader)
-
+                    print(f"bleu_ref: {bleuRef:.5f}, rec_bleu: {recBleu:.5f}")
+                    print(f"domain_acc: {domAcc:.5f}, tran_acc: {tranAcc:.5f}")
                     self.writer.add_scalars('accu',
                         {'val_transfer': tranAcc,
                          'val_domain': domAcc}, gstep)
                     self.writer.add_scalars('bleu',
-                        {'val_ref': bleuRef}, gstep)
+                        {'val_ref': bleuRef, 'val_rec': recBleu}, gstep)
 
                     if bleuRef > bestbleu and tranAcc > self.cutAcc:
                         bestbleu = bleuRef
-                        bleuRefOL, bleuOriOL, tranAccOL, domAccOL, sampleStr = \
+                        bleuRefOL, bleuOriOL, tranAccOL, domAccOL, sampleStr, recBleuOL = \
                             self.evaluate(self.onlineLoader)
-
+                        print(f"bleu_ori: {bleuOriOL:.5f}, bleu_ref: {bleuRefOL:.5f}, rec_bleu: {recBleuOL:.5f}")
+                        print(f"domain_acc: {domAccOL:.5f}, tran_acc: {tranAccOL:.5f}")
                         self.writer.add_scalars('accu',
                             {'ol_transfer': tranAccOL,
                              'ol_domain': domAccOL}, gstep)
                         self.writer.add_scalars('bleu',
                             {'ol_ref': bleuRefOL,
-                             'ol_ori': bleuOriOL}, gstep)
-                        if ep > self.prepEpoch:
+                             'ol_ori': bleuOriOL, 'ol_rec': recBleuOL}, gstep)
+                        if ep >= self.prepEpoch:
                             outSample.write_text(sampleStr)
 
                     # save model
                     torch.save(self.model.state_dict(), outModel)
+            if ep >= self.prepEpoch:
+                self.scheduler.step()
             pbar.close()
 
     def _trainPrepStep(self, src, tgt):
@@ -143,9 +152,12 @@ class DASTTrainer(object):
             _, domPreds = self.domainClf(*domInps)
             domAcc += (domPreds == 1).sum(0).item()
 
-        bleuRef = corpus_bleu([ref.split() for ref in styleRefs],
+        recBleu = corpus_bleu([[ori.split()] for ori in originals],
+            recBows, smoothing_function=self.smoothie)
+
+        bleuRef = corpus_bleu([[ref.split()] for ref in styleRefs],
             hypoBows, smoothing_function=self.smoothie)
-        bleuOri = corpus_bleu([ori.split() for ori in originals],
+        bleuOri = corpus_bleu([[ori.split()] for ori in originals],
             hypoBows, smoothing_function=self.smoothie) \
             if dataLoader.dataset.isOnline else bleuRef
 
@@ -153,7 +165,7 @@ class DASTTrainer(object):
         tranAcc /= len(dataLoader) * bz
         domAcc /= len(dataLoader) * bz
         sampleStr = self.outputString(recBows, hypoBows, styleRefs, originals)
-        return bleuRef, bleuOri, tranAcc, domAcc, sampleStr
+        return bleuRef, bleuOri, tranAcc, domAcc, sampleStr, recBleu
 
     @staticmethod
     def idToBow(ids, vocab):
@@ -235,7 +247,7 @@ class ClassifierTrainer(object):
 
                 outModel = self.outpath / f"{self.prefix}Classif_{ep}_{gstep}.pt"
                 if gstep % self.checkpoint == 0:
-                    acc = self.evaluate()
+                    acc = self.evaluate(self.validLoader)
                     print(f" Validation Accu: {acc:.5f}")
                     if acc > best_dev:
                         best_dev = acc
@@ -250,11 +262,11 @@ class ClassifierTrainer(object):
         self.optimizer.zero_grad()
         return loss.item()
 
-    def evaluate(self):
+    def evaluate(self, dataLoader):
         self.model.eval()
         total = 0
         correct = 0
-        for inp in self.validLoader:
+        for inp in dataLoader:
             labels = inp.tgtDom if self.isDomain else inp.label
             _, preds = self.model(inp.enc, inp.encLen)
             total += len(preds)

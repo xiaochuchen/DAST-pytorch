@@ -3,6 +3,7 @@ import torch
 from torch import LongTensor, Tensor
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence
 
 
 def paddedMask(seqs: LongTensor, seqLens: LongTensor) -> Tensor:
@@ -28,28 +29,49 @@ class ClassifierCNN(nn.Module):
         return pooled
 
 
-class Discriminator(nn.Module):
-
+class BaseClassifier(nn.Module):
     def __init__(self, vz, embz, nfilters):
         super().__init__()
-        filterL = [1, 2, 3, 4, 5]
+        self.filterL = [1, 2, 3, 4, 5]
         self.emb = nn.Embedding(vz, embedding_dim=embz)
         self.cnnL = nn.ModuleList([ClassifierCNN(filsize, nfilters, embz)
-                                   for filsize in filterL])
+                                   for filsize in self.filterL])
         self.dropout = nn.Dropout(0.5)  # default 0.5
-        self.linear = nn.Linear(nfilters * len(filterL), 2)
-        self.celoss = nn.CrossEntropyLoss(reduction='mean')
 
     def forward(self, inp, inpLen, labels=None):
-        mask = paddedMask(inp, inpLen).unsqueeze(-1)  # (bz, ts, 1)
         embed = self.emb(inp) if inp.dim() < 3 else \
-            torch.tensordot(inp, self.emb.weight, dims=[[2], [0]])
+            torch.tensordot(inp, self.emb.weight, dims=[[2], [0]])[:, :-1, :]
+        mask = paddedMask(embed, inpLen).unsqueeze(-1)  # (bz, ts, 1)
         embedMsk = embed * mask
         outputs = torch.cat([mod(embedMsk) for mod in self.cnnL], dim=1)
         dout = self.dropout(outputs)
+        return dout
+
+
+class Discriminator(BaseClassifier):
+    def __init__(self, vz, embz, nfilters):
+        super().__init__(vz, embz, nfilters)
+        self.linear = nn.Linear(nfilters * len(self.filterL), 1)
+        self.bceloss = nn.BCEWithLogitsLoss(reduction='mean')
+
+    def forward(self, inp, inpLen, labels=None):
+        dout = super().forward(inp, inpLen, labels)
+        logits = self.linear(dout).reshape(-1)
+        bceloss = self.bceloss(logits, labels) if labels is not None else None
+        return bceloss, logits
+
+
+class Evaluator(BaseClassifier):
+    def __init__(self, vz, embz, nfilters):
+        super().__init__(vz, embz, nfilters)
+        self.linear = nn.Linear(nfilters * len(self.filterL), 2)
+        self.celoss = nn.CrossEntropyLoss(reduction='mean')
+
+    def forward(self, inp, inpLen, labels=None):
+        dout = super().forward(inp, inpLen, labels)
         logits = self.linear(dout)
+        loss = self.celoss(logits, labels.long()) if labels is not None else None
         preds = torch.argmax(torch.softmax(logits, dim=-1), dim=-1)
-        loss = self.celoss(logits, labels) if labels is not None else None
         return loss, preds
 
 
@@ -68,33 +90,15 @@ class Generator(nn.Module):
         self.celoss = nn.CrossEntropyLoss(reduction='none')
         self.device = device
 
-    def autogen(self, inp):
-        origInfo, tranInfo = self._encode(inp)
-        out, _, _ = self._decode(inp.dec, origInfo)
-        dmask = paddedMask(inp.dec, inp.decLen).reshape(-1)
-        decOut = self.dropout(out).reshape([-1, self.hz_dec])
-        logits = self.proj(decOut)
-        loss = self.celoss(logits, inp.tar.reshape(-1)) * dmask
-        aeLoss = loss.mean() / inp.tar.shape[0]
-        return aeLoss, origInfo, tranInfo
-
-    def forward(self, inp, isEval=False):
-        aeLoss, origInfo, tranInfo = self.autogen(inp)
-        _, _, tranSoft = self._decode(inp.dec, tranInfo, self.gumbel)
-
-        recIDs, tranIDs = None, None
-        if isEval:
-            _, _, recIDs = self._decode(inp.dec, origInfo, self.greedy)
-            _, _, tranIDs = self._decode(inp.dec, tranInfo, self.greedy)
-        return aeLoss, tranSoft, recIDs, tranIDs
-
     def _encode(self, inp):
         encs = inp.enc[:, :max(inp.encLen)]  # trim extra padding
         encEmb = self.emb(encs)
         encInp = self.dropout(encEmb)
-        _, ht = self.gruEnc(encInp)
+        encPacked = pack_padded_sequence(encInp, inp.encLen.cpu(),
+            batch_first=True, enforce_sorted=False)
+        _, ht = self.gruEnc(encPacked)
 
-        labels = inp.label.float()
+        labels = inp.label
         domVec = self.domLinear(torch.ones(labels.shape[0], 1, device=self.device) *
                                 inp.tgtDom.reshape(-1, 1))
         styOrig = self.styLinear(labels.reshape([-1, 1]))
@@ -103,32 +107,64 @@ class Generator(nn.Module):
         tranInfo = torch.cat([styTran, domVec, ht.squeeze()], dim=1)
         return origInfo, tranInfo
 
-    def _decode(self, decs, h0, func=None):
-        hid = []
-        pemb = None
-        idL = []
+    def autogen(self, inp):
+        origInfo, tranInfo = self._encode(inp)
+        out = self._decodeWithTeacher(inp.dec, origInfo)
+        dmask = paddedMask(inp.dec, inp.decLen).reshape(-1)
+        decOut = self.dropout(out).reshape([-1, self.hz_dec])
+        logits = self.proj(decOut)
+        loss = self.celoss(logits, inp.tar.reshape(-1)) * dmask
+        aeLoss = loss.sum() / inp.enc.shape[0]
+        return aeLoss, origInfo, tranInfo
+
+    def forward(self, inp, isEval=False):
+        aeLoss, origInfo, tranInfo = self.autogen(inp)
+        tranSoft = self._decodeGumbel(inp.dec, tranInfo)
+
+        recIDs, tranIDs = None, None
+        if isEval:
+            recIDs = self._decodeGreedy(inp.dec, origInfo)
+            tranIDs = self._decodeGreedy(inp.dec, tranInfo)
+        return aeLoss, tranSoft, recIDs, tranIDs
+
+    def _decodeWithTeacher(self, decs, h0):
         h = h0
+        hid = []
+        for dt in torch.split(decs, 1, dim=1):
+            decEmb = self.emb(dt.squeeze())
+            inp = self.dropout(decEmb)
+            h = self.gruDecCell(inp, h)
+            hid.append(h)
+        out = torch.stack(hid, dim=1)
+        return out  # (bz, ts, hz)
+
+    def _decodeGumbel(self, decs, h0):
+        h = h0
+        probaL = []
+        pemb = None
         for dt in torch.split(decs, 1, dim=1):
             decEmb = self.emb(dt.squeeze()) if pemb is None else pemb
             inp = self.dropout(decEmb)
             h = self.gruDecCell(inp, h)
-            hid.append(h)
-            pemb, pid = func(h) if func else (None, dt)
-            idL.append(pid)
+            hdrop = self.dropout(h)
+            proba = F.gumbel_softmax(self.proj(hdrop), tau=0.1)  # eps = 1e-20 deprecated, tau is gamma in the original code
+            probaL.append(proba)
+            pemb = torch.matmul(proba, self.emb.weight)  # (bz, embz)
+        return torch.stack(probaL, dim=1)  # (bz, ts, vz)
 
-        out = torch.stack(hid, dim=1)
-        predIDs = torch.stack(idL, dim=1)
-        return out, h, predIDs
-
-    def gumbel(self, h):
-        proba = F.gumbel_softmax(self.proj(h), tau=0.1)  # eps = 1e-20 deprecated, tau is gamma in the original code
-        inp = torch.matmul(proba, self.emb.weight)
-        return inp, proba
-
-    def greedy(self, h):
-        ids = torch.argmax(self.proj(h), 1)
-        inp = self.emb(ids)
-        return inp, ids
+    def _decodeGreedy(self, decs, h0):
+        h = h0
+        idL = []
+        pemb = None
+        for dt in torch.split(decs, 1, dim=1):
+            decEmb = self.emb(dt.squeeze()) if pemb is None else pemb
+            inp = self.dropout(decEmb)
+            h = self.gruDecCell(inp, h)
+            hdrop = self.dropout(h)
+            ids = torch.argmax(self.proj(hdrop), 1)
+            idL.append(ids)
+            pemb = self.emb(ids)  # (bz, embz)
+        return torch.stack(idL, dim=1)  # (bz, ts)
 
     def domainLoss(self):
         posv = self.domLinear(torch.ones(1, 1, device=self.device))
@@ -156,12 +192,8 @@ class DAST(nn.Module):
             tgtAELoss, tgtTranSoft, *_ = self.gen(tgt)
             srcAELoss, srcTranSoft, *_ = self.gen(src)
 
-            self.discTgt.eval()
-            self.discSrc.eval()
-            tgtGLoss, *_ = self.discTgt(tgtTranSoft[:, :-1, :],
-                tgt.encLen, 1-tgt.label)
-            srcGLoss, *_ = self.discSrc(srcTranSoft[:, :-1, :],
-                src.encLen, 1-src.label)
+            tgtGLoss, *_ = self.discTgt(tgtTranSoft, tgt.encLen, 1-tgt.label)
+            srcGLoss, *_ = self.discSrc(srcTranSoft, src.encLen, 1-src.label)
 
             genLoss = tgtGLoss + srcGLoss
         else:
@@ -174,12 +206,12 @@ class DAST(nn.Module):
         return totLoss, genLoss
 
     def classify(self, src, tgt):
-        tgtDLoss, *_ = self.discTgt(tgt.dec[:, 1:], tgt.encLen, tgt.label)
-        srcDLoss, *_ = self.discSrc(src.dec[:, 1:], src.encLen, src.label)
+        tgtDLoss, *_ = self.discTgt(tgt.enc, tgt.encLen, tgt.label)
+        srcDLoss, *_ = self.discSrc(src.enc, src.encLen, src.label)
         return tgtDLoss + srcDLoss
 
     def evaluate(self, tgt):
         aeLoss, tranSoft, recIDs, tranIDs = self.gen(tgt, isEval=True)
-        discLoss, *_ = self.discTgt(tgt.dec[:, 1:], tgt.encLen, tgt.label)
-        genLoss, *_ = self.discTgt(tranSoft[:, :-1, :], tgt.encLen, 1-tgt.label)
+        discLoss, *_ = self.discTgt(tgt.enc, tgt.encLen, tgt.label)
+        genLoss, *_ = self.discTgt(tranSoft, tgt.encLen, 1-tgt.label)
         return aeLoss, discLoss, genLoss, recIDs, tranIDs

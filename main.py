@@ -5,7 +5,7 @@ import json
 import click
 import torch
 
-from models import DAST, Discriminator
+from models import DAST, Evaluator
 from vocab import buildVocab, buildMixVocab, Vocabulary
 from inp_pipe import (getBalancedLoader, getOnlineDataLoader,
                       getMixLoader, getTargetLoader)
@@ -27,7 +27,12 @@ def loadWeights(model, path, device):
     return model, int(ep) + 1, int(gstep)
 
 
-@click.command()
+@click.group()
+def main():
+    pass
+
+
+@main.command()
 @click.argument('config_json')
 def train_DAST(config_json: str):
     DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -62,21 +67,21 @@ def train_DAST(config_json: str):
     print(f"Target vocabulary size: {tarVocab.size}")
 
     srcLoader = getBalancedLoader(IMDB_DIR, "train", mixVocab, bz, mlen,
-        tgtDom=False, device=DEV, frac=frac)
+        tgtDom=False, device=DEV, frac=1.0)
     tgtLoader = getBalancedLoader(YELP_DIR, "train", mixVocab, bz, mlen,
         tgtDom=True, device=DEV, frac=frac)
     valLoader = getBalancedLoader(YELP_DIR, "valid", mixVocab, bz, mlen,
-        tgtDom=True, device=DEV, frac=frac)
+        tgtDom=True, device=DEV, frac=1.0)
     onlineLoader = getOnlineDataLoader(YELP_DIR, "online-test", mixVocab,
         bz, mlen, device=DEV)
 
     modDAST = DAST(mixVocab.size, embz, hz, domz, stylez, nfilters, alpha, rho, DEV)
     modDAST, ep_init, gstep = loadWeights(modDAST, OUT_DIR, DEV)
 
-    targetClf = Discriminator(tarVocab.size, embz, nfilters)
+    targetClf = Evaluator(tarVocab.size, embz, nfilters)
     targetClf, *_ = loadWeights(targetClf, YELP_CLF_DIR, DEV)
 
-    domainClf = Discriminator(mixVocab.size, embz, nfilters)
+    domainClf = Evaluator(mixVocab.size, embz, nfilters)
     domainClf, *_ = loadWeights(domainClf, IY_CLF_DIR, DEV)
 
     trainer = DASTTrainer(
@@ -86,8 +91,13 @@ def train_DAST(config_json: str):
         OUT_DIR, LOG_DIR, DEV)
     trainer.train(ep_init, gstep)
 
+    bleuRef, bleuOri, tranAcc, domAcc, sampleStr, recBleu = trainer.evaluate(onlineLoader)
+    print(f"bleuRefOL: {bleuRef}, bleuOri: {bleuOri}, recBleu: {recBleu}")
+    print(f"S-Acc: {tranAcc}, D-Acc: {domAcc}")
+    Path("smallsample.txt").write_text(sampleStr)
 
-@click.command()
+
+@main.command()
 @click.argument('config_json')
 def train_classifier(config_json: str):
     DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,13 +127,17 @@ def train_classifier(config_json: str):
             device=DEV, frac=frac)
         validLoader = getMixLoader(IMDB_DIR, YELP_DIR, "valid", vocab, bz, mlen,
             device=DEV, frac=frac)
+        testLoader = getMixLoader(IMDB_DIR, YELP_DIR, "test", vocab, bz, mlen,
+            device=DEV, frac=frac)
     else:
         trainLoader = getTargetLoader(YELP_DIR, "train", vocab, bz, mlen,
             device=DEV, frac=frac)
         validLoader = getTargetLoader(YELP_DIR, "valid", vocab, bz, mlen,
             device=DEV, frac=frac)
+        testLoader = getTargetLoader(YELP_DIR, "test", vocab, bz, mlen,
+            device=DEV, frac=frac)
 
-    model = Discriminator(vocab.size, embz, nfilters)
+    model = Evaluator(vocab.size, embz, nfilters)
     model, ep_init, gstep = loadWeights(model, outpath, DEV)
 
     trainer = ClassifierTrainer(
@@ -132,6 +146,9 @@ def train_classifier(config_json: str):
         outpath, LOG_DIR)
     trainer.train(ep_init, gstep)
 
+    acc = trainer.evaluate(testLoader)
+    print(f" TEST Accu: {acc:.5f}")
+
 
 if __name__ == '__main__':
-    train_DAST()
+    main()

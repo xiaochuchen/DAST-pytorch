@@ -57,8 +57,7 @@ def buildMixVocab(source, target, min_occur=2):
                 for w in procFileToBow(file)]
     tgtWords = [w for file in target.glob("*.txt")
                 for w in procFileToBow(file)]
-    tgtSet = set(tgtWords)
 
     bow = [w for w, ct in Counter(srcWords + tgtWords).items()
-           if ct >= min_occur or w in tgtSet]
+           if ct >= min_occur]
     return Vocabulary(bow)
